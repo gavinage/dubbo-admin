@@ -16,35 +16,63 @@
  */
 package org.apache.dubbo.admin.service;
 
+import com.alibaba.cloud.dubbo.metadata.ServiceRestMetadata;
+import com.alibaba.cloud.dubbo.metadata.repository.DubboServiceMetadataRepository;
+import com.alibaba.cloud.dubbo.registry.event.ServiceInstancesChangedEvent;
+import com.alibaba.cloud.dubbo.registry.event.SubscribedServicesChangedEvent;
+import com.alibaba.cloud.dubbo.service.DubboMetadataService;
+import com.alibaba.cloud.dubbo.service.DubboMetadataServiceProxy;
+import com.alibaba.cloud.dubbo.util.JSONUtils;
+import com.alibaba.cloud.nacos.NacosServiceManager;
+import com.alibaba.cloud.nacos.discovery.NacosDiscoveryClient;
+import com.alibaba.fastjson.JSON;
 import org.apache.dubbo.admin.common.util.CoderUtil;
 import org.apache.dubbo.admin.common.util.Constants;
 import org.apache.dubbo.admin.common.util.Tool;
 import org.apache.dubbo.common.URL;
-import org.apache.dubbo.common.logger.Logger;
-import org.apache.dubbo.common.logger.LoggerFactory;
+
+
 import org.apache.dubbo.common.utils.NetUtils;
 import org.apache.dubbo.common.utils.StringUtils;
 import org.apache.dubbo.registry.NotifyListener;
 import org.apache.dubbo.registry.Registry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.cloud.client.ServiceInstance;
+import org.springframework.cloud.client.discovery.DiscoveryClient;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
+import org.springframework.util.CollectionUtils;
 
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import javax.annotation.Resource;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Component
 public class RegistryServerSync implements DisposableBean, NotifyListener {
 
     private static final Logger logger = LoggerFactory.getLogger(RegistryServerSync.class);
+
+    @Resource
+    private DubboServiceMetadataRepository dubboServiceMetadataRepository;
+
+    @Resource
+    private DubboMetadataServiceProxy dubboMetadataConfigServiceProxy;
+
+    @Autowired
+    private NacosServiceManager nacosServiceManager;
+
+    @Autowired
+    private DiscoveryClient nacosDiscoveryClient;
+
+    @Resource
+    private JSONUtils jsonUtils;
 
     private static final URL SUBSCRIBE = new URL(Constants.ADMIN_PROTOCOL, NetUtils.getLocalHost(), 0, "",
             Constants.INTERFACE_KEY, Constants.ANY_VALUE,
@@ -88,9 +116,94 @@ public class RegistryServerSync implements DisposableBean, NotifyListener {
         registry.unsubscribe(SUBSCRIBE, this);
     }
 
+    private AtomicBoolean isFirst = new AtomicBoolean(false);
+
+    @EventListener(SubscribedServicesChangedEvent.class)
+    public void start(SubscribedServicesChangedEvent event) throws Exception {
+
+        logger.info("event=>{}" , JSON.toJSONString(event));
+        logger.info("============================>");
+
+        Set<String> allServiceKeys = dubboServiceMetadataRepository.getSubscribedServices();
+        logger.info("订阅的所有服务：{}",allServiceKeys);
+        // true 是第一次  false 不是第一次
+        boolean compareAndSet = isFirst.compareAndSet(false, true);
+        for (String serviceName:allServiceKeys){
+            try {
+
+                List<ServiceInstance> instances = nacosDiscoveryClient.getInstances(serviceName);
+                if (compareAndSet && !CollectionUtils.isEmpty(instances)) {
+                    ///第一次 并且 有实例 该情况调用这个会产生死锁  dubboMetadataConfigServiceProxy.getProxy(serviceName);
+                    logger.warn("第一次 并且 有实例 跳过 {}", serviceName);
+                    continue;
+                }
+
+                if (!compareAndSet && CollectionUtils.isEmpty(instances)) {
+                    // 非第一次， 没有实例  跳过
+                    logger.warn("非第一次， 没有实例 {}", serviceName);
+                    continue;
+                }
+
+
+                boolean initialized =  dubboMetadataConfigServiceProxy.isInitialized(serviceName);
+                if (!initialized) {
+                    DubboMetadataService proxy = dubboMetadataConfigServiceProxy.getProxy(serviceName);
+                    logger.warn("initialized = false , 手动调用一次getProxy(serviceName) ", serviceName);
+                }
+                if(initialized){
+
+                    DubboMetadataService proxy = dubboMetadataConfigServiceProxy.getProxy(serviceName);
+                    Map<String, String> allExportedURLs = proxy.getAllExportedURLs();
+
+                    if(allExportedURLs !=null && !allExportedURLs.isEmpty()){
+                        allExportedURLs.forEach((key,value)->{
+                            List<URL> urlList = jsonUtils.toURLs(value);
+                            cacheURL(urlList);
+                        });
+                        logger.info("所有导出的接口：{}",allExportedURLs);
+                    }
+                }
+            }catch (Exception e){
+                logger.error("获取服务暴露的URL出错,服务名：{}",serviceName);
+            }
+
+        }
+
+    }
+
+
+    //@EventListener(ServiceInstancesChangedEvent.class)
+    public void start(ServiceInstancesChangedEvent event) throws Exception {
+
+        logger.info("ServiceInstancesChangedEvent start =>{} " , JSON.toJSONString(event));
+        logger.info("============================>");
+
+        try {
+
+                DubboMetadataService proxy = dubboMetadataConfigServiceProxy.getProxy(event.getServiceInstances());
+                Map<String, String> allExportedURLs = proxy.getAllExportedURLs();
+                if (allExportedURLs != null && !allExportedURLs.isEmpty()) {
+                    allExportedURLs.forEach((key, value) -> {
+                        List<URL> urlList = jsonUtils.toURLs(value);
+                        cacheURL(urlList);
+                    });
+                    logger.info("所有导出的接口：{}",allExportedURLs);
+                }
+
+            logger.info("ServiceInstancesChangedEvent end =>{} " , JSON.toJSONString(event));
+        } catch (Exception e) {
+            logger.error("", e);
+        }
+    }
+
     // Notification of of any service with any type (override、subcribe、route、provider) is full.
     @Override
     public void notify(List<URL> urls) {
+
+        cacheURL(urls);
+    }
+
+    private void cacheURL(List<URL> urls) {
         if (urls == null || urls.isEmpty()) {
             return;
         }
@@ -165,5 +278,7 @@ public class RegistryServerSync implements DisposableBean, NotifyListener {
             services.putAll(categoryEntry.getValue());
         }
     }
+
+
 }
 
